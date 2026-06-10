@@ -1,0 +1,4 @@
+config.yaml
+*.grb2
+*.part
+.DS_Store
