@@ -132,13 +132,15 @@ def cleanup_old_runs(directory: str, keep_runs: int, log_prefix: str):
 # ── GFS (NOMADS grib_filter) ──────────────────────────────────────────────────
 
 GFS_DEFAULT_VARS = ["UGRD", "VGRD", "GUST", "TMP", "PRMSL", "RH", "APCP", "TCDC"]
+# NOMADS product name per resolution — note 0p50 is "pgrb2full"
+GFS_PRODUCTS = {"0p25": "pgrb2.0p25", "0p50": "pgrb2full.0p50", "1p00": "pgrb2.1p00"}
 GFS_DEFAULT_LEVELS = [
     "10_m_above_ground", "2_m_above_ground", "surface",
     "mean_sea_level", "entire_atmosphere",
 ]
 
 
-def gfs_fetch(source: dict) -> bool:
+def gfs_fetch(source: dict) -> str:
     res = source.get("resolution", "0p25")
     directory = source["directory"]
     steps = steps_list(source.get("steps", {"from": 0, "to": 24, "by": 3}))
@@ -147,15 +149,17 @@ def gfs_fetch(source: dict) -> bool:
     levels = source.get("levels", GFS_DEFAULT_LEVELS)
     name = source["name"]
 
+    prod = GFS_PRODUCTS.get(res, f"pgrb2.{res}")
     for run in candidate_runs(cadence_h=6, delay_h=3.5):
         stamp = run_stamp(run)
         if latest_complete_stamp(directory) == stamp:
-            return False  # up to date
+            return "up-to-date"
         # Run available (incl. last step)? Probe the .idx on the pub server.
         date, hh = run.strftime("%Y%m%d"), run.strftime("%H")
         probe = (f"https://nomads.ncep.noaa.gov/pub/data/nccf/com/gfs/prod/"
-                 f"gfs.{date}/{hh}/atmos/gfs.t{hh}z.pgrb2.{res}.f{steps[-1]:03d}.idx")
+                 f"gfs.{date}/{hh}/atmos/gfs.t{hh}z.{prod}.f{steps[-1]:03d}.idx")
         if not http_ok(probe):
+            log.info("%s: run %s not published yet (probe failed)", name, stamp)
             continue
 
         log.info("%s: downloading run %s (%d steps)", name, stamp, len(steps))
@@ -164,23 +168,22 @@ def gfs_fetch(source: dict) -> bool:
             lat0, lon0, lat1, lon1 = bbox
             params += ["subregion=", f"leftlon={lon0}", f"rightlon={lon1}",
                        f"bottomlat={lat0}", f"toplat={lat1}"]
-        ok = True
         for step in steps:
             dest = os.path.join(directory, f"{name}__{stamp}__f{step:03d}.grb2")
             if os.path.exists(dest):
                 continue
             url = (f"https://nomads.ncep.noaa.gov/cgi-bin/filter_gfs_{res}.pl?"
                    f"dir=%2Fgfs.{date}%2F{hh}%2Fatmos"
-                   f"&file=gfs.t{hh}z.pgrb2.{res}.f{step:03d}&" + "&".join(params))
+                   f"&file=gfs.t{hh}z.{prod}.f{step:03d}&" + "&".join(params))
             if not download(url, dest):
-                ok = False
-                break
-        if ok:
-            open(marker_path(directory, stamp), "w").close()
-            cleanup_old_runs(directory, source.get("keep_runs", 1), name)
-            log.info("%s: run %s complete", name, stamp)
-            return True
-    return False
+                log.error("%s: run %s failed at step f%03d — aborting", name, stamp, step)
+                return "failed"
+        open(marker_path(directory, stamp), "w").close()
+        cleanup_old_runs(directory, source.get("keep_runs", 1), name)
+        log.info("%s: run %s complete", name, stamp)
+        return "downloaded"
+    log.info("%s: no published run found among recent cycles", name)
+    return "unavailable"
 
 
 # ── Météo-France (AROME / ARPEGE, OVH public bucket) ─────────────────────────
@@ -210,13 +213,13 @@ MF_MODELS = {
 }
 
 
-def mf_fetch(source: dict) -> bool:
+def mf_fetch(source: dict) -> str:
     model = source["model"]
     res = str(source.get("resolution", "0025" if model == "arome" else "025"))
     key = (model, res)
     if key not in MF_MODELS:
         log.error("%s: unknown %s resolution %r", source["name"], model, res)
-        return False
+        return "failed"
     template, all_groups, cadence, delay = MF_MODELS[key]
     groups = source.get("groups", all_groups)
     packages = source.get("packages", ["SP1"])
@@ -226,16 +229,16 @@ def mf_fetch(source: dict) -> bool:
     for run in candidate_runs(cadence_h=cadence, delay_h=delay):
         stamp = run_stamp(run)
         if latest_complete_stamp(directory) == stamp:
-            return False
+            return "up-to-date"
         d = run.strftime("%Y-%m-%dT%H:00:00Z")
         # Run available? Probe the last requested group of the first package.
         probe = f"{MF_BASE}/" + template.format(d=d, p=packages[0], g=groups[-1])
         if not http_ok(probe):
+            log.info("%s: run %s not published yet (probe failed)", name, stamp)
             continue
 
         log.info("%s: downloading run %s (%d packages × %d groups)",
                  name, stamp, len(packages), len(groups))
-        ok = True
         for p in packages:
             for g in groups:
                 dest = os.path.join(directory, f"{name}__{stamp}__{p}_{g}.grb2")
@@ -243,16 +246,14 @@ def mf_fetch(source: dict) -> bool:
                     continue
                 url = f"{MF_BASE}/" + template.format(d=d, p=p, g=g)
                 if not download(url, dest):
-                    ok = False
-                    break
-            if not ok:
-                break
-        if ok:
-            open(marker_path(directory, stamp), "w").close()
-            cleanup_old_runs(directory, source.get("keep_runs", 1), name)
-            log.info("%s: run %s complete", name, stamp)
-            return True
-    return False
+                    log.error("%s: run %s failed at %s/%s — aborting", name, stamp, p, g)
+                    return "failed"
+        open(marker_path(directory, stamp), "w").close()
+        cleanup_old_runs(directory, source.get("keep_runs", 1), name)
+        log.info("%s: run %s complete", name, stamp)
+        return "downloaded"
+    log.info("%s: no published run found among recent cycles", name)
+    return "unavailable"
 
 
 # ── DWD ICON-EU (opendata.dwd.de) ─────────────────────────────────────────────
@@ -264,7 +265,7 @@ ICON_EU_DEFAULT_VARS = [
 ICON_EU_BASE = "https://opendata.dwd.de/weather/nwp/icon-eu/grib"
 
 
-def icon_eu_fetch(source: dict) -> bool:
+def icon_eu_fetch(source: dict) -> str:
     directory = source["directory"]
     steps = steps_list(source.get("steps", {"from": 0, "to": 48, "by": 3}))
     variables = source.get("variables", ICON_EU_DEFAULT_VARS)
@@ -273,7 +274,7 @@ def icon_eu_fetch(source: dict) -> bool:
     for run in candidate_runs(cadence_h=6, delay_h=3.0):
         stamp = run_stamp(run)
         if latest_complete_stamp(directory) == stamp:
-            return False
+            return "up-to-date"
         hh = run.strftime("%H")
         ymdh = run.strftime("%Y%m%d%H")
         # Run available (incl. last step)? Probe the first variable.
@@ -281,11 +282,11 @@ def icon_eu_fetch(source: dict) -> bool:
         probe = (f"{ICON_EU_BASE}/{hh}/{v0}/icon-eu_europe_regular-lat-lon_"
                  f"single-level_{ymdh}_{steps[-1]:03d}_{v0.upper()}.grib2.bz2")
         if not http_ok(probe):
+            log.info("%s: run %s not published yet (probe failed)", name, stamp)
             continue
 
         log.info("%s: downloading run %s (%d steps × %d vars)",
                  name, stamp, len(steps), len(variables))
-        ok = True
         for step in steps:
             dest = os.path.join(directory, f"{name}__{stamp}__f{step:03d}.grb2")
             if os.path.exists(dest):
@@ -306,17 +307,16 @@ def icon_eu_fetch(source: dict) -> bool:
                         out.write(bz2.decompress(r.content))
                 os.replace(part, dest)
             except (requests.RequestException, IOError, OSError) as e:
-                log.warning("%s: step %d failed: %s", name, step, e)
+                log.error("%s: run %s failed at step f%03d: %s — aborting", name, stamp, step, e)
                 if os.path.exists(part):
                     os.unlink(part)
-                ok = False
-                break
-        if ok:
-            open(marker_path(directory, stamp), "w").close()
-            cleanup_old_runs(directory, source.get("keep_runs", 1), name)
-            log.info("%s: run %s complete", name, stamp)
-            return True
-    return False
+                return "failed"
+        open(marker_path(directory, stamp), "w").close()
+        cleanup_old_runs(directory, source.get("keep_runs", 1), name)
+        log.info("%s: run %s complete", name, stamp)
+        return "downloaded"
+    log.info("%s: no published run found among recent cycles", name)
+    return "unavailable"
 
 
 # ── Main ──────────────────────────────────────────────────────────────────────
@@ -329,17 +329,18 @@ FETCHERS = {
 }
 
 
-def process_source(source: dict):
+def process_source(source: dict) -> str:
     model = source.get("model")
     fetcher = FETCHERS.get(model)
     if not fetcher:
         log.error("%s: unknown model %r", source.get("name"), model)
-        return
+        return "failed"
     os.makedirs(source["directory"], exist_ok=True)
     try:
-        fetcher(source)
+        return fetcher(source)
     except Exception:
         log.exception("%s: unexpected error", source.get("name"))
+        return "failed"
 
 
 def main():
@@ -369,10 +370,14 @@ def main():
 
     interval = int(config.get("interval_minutes", 10))
     while True:
+        failed = False
         for source in sources:
-            process_source(source)
+            outcome = process_source(source)
+            log.info("%s: %s", source.get("name"), outcome)
+            failed = failed or outcome == "failed"
         if not args.loop:
-            break
+            # Non-zero exit lets job runners surface the failure to the user.
+            sys.exit(1 if failed else 0)
         time.sleep(interval * 60)
 
 
