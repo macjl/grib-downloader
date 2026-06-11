@@ -16,8 +16,9 @@ Supported models:
 
 Files are written atomically (.part → .grb2) so a concurrent scanner never
 sees a partial file. A run is marked complete with a `.run-<stamp>.complete`
-marker; once a newer run completes, files of older runs are deleted
-(keep_runs per source).
+marker; once a newer run completes, older complete runs are moved to
+<dir>/archive/ (archive_runs kept, 0 by default = deleted) and leftovers
+of interrupted runs are purged.
 
 Usage:
   downloader.py --config config.yaml [--source NAME] (--once | --loop)
@@ -109,24 +110,82 @@ def latest_complete_stamp(directory: str):
     return max(stamps) if stamps else None
 
 
-def cleanup_old_runs(directory: str, keep_runs: int, log_prefix: str):
-    """Keep the newest keep_runs completed runs; delete files of older ones."""
+def file_run_stamp(filename: str):
+    """Run stamp of a file: either '...__<stamp>__...' or a run marker."""
+    m = re.search(r"__(\d{8}T\d{2})__", filename)
+    if m:
+        return m.group(1)
+    m = re.match(r"\.run-(\d{8}T\d{2})\.complete$", filename)
+    return m.group(1) if m else None
+
+
+def cleanup_old_runs(directory: str, archive_runs: int, log_prefix: str):
+    """Called after a run completes. Keeps only the newest complete run in
+    the active directory:
+
+    - older *complete* runs (marker present) are moved to <directory>/archive/
+      when archive_runs > 0, deleted otherwise. The archive is invisible to
+      the provider, which only reads GRIB files at the source level.
+    - leftovers of *incomplete* runs (no marker — interrupted/failed
+      downloads) older than the newest complete run are deleted, along with
+      stale .part files (> 1 h).
+    - the archive keeps the newest archive_runs runs.
+    """
     try:
         files = os.listdir(directory)
     except FileNotFoundError:
         return
-    stamps = sorted({m.group(1) for f in files
-                     if (m := re.match(r"\.run-(\d{8}T\d{2})\.complete$", f))},
-                    reverse=True)
-    for old in stamps[keep_runs:]:
-        for f in files:
-            if f"__{old}__" in f or f == f".run-{old}.complete":
-                path = os.path.join(directory, f)
-                try:
-                    os.unlink(path)
-                except OSError as e:
-                    log.warning("%s: cannot delete %s: %s", log_prefix, f, e)
-        log.info("%s: purged run %s", log_prefix, old)
+    markers = {m.group(1) for f in files
+               if (m := re.match(r"\.run-(\d{8}T\d{2})\.complete$", f))}
+    if not markers:
+        return
+    newest = max(markers)
+    archive_dir = os.path.join(directory, "archive")
+    archived, deleted = set(), set()
+
+    for f in files:
+        full = os.path.join(directory, f)
+        if not os.path.isfile(full):
+            continue
+        if f.endswith(".part"):
+            try:
+                if time.time() - os.path.getmtime(full) > 3600:
+                    os.unlink(full)
+                    log.info("%s: removed stale partial file %s", log_prefix, f)
+            except OSError:
+                pass
+            continue
+        stamp = file_run_stamp(f)
+        if stamp is None or stamp >= newest:
+            continue  # current run, or unrelated file (left alone)
+        try:
+            if stamp in markers and archive_runs > 0:
+                os.makedirs(archive_dir, exist_ok=True)
+                os.replace(full, os.path.join(archive_dir, f))
+                archived.add(stamp)
+            else:
+                os.unlink(full)
+                deleted.add(stamp)
+        except OSError as e:
+            log.warning("%s: cannot clean %s: %s", log_prefix, f, e)
+
+    for stamp in sorted(archived):
+        log.info("%s: archived run %s", log_prefix, stamp)
+    for stamp in sorted(deleted):
+        log.info("%s: purged run %s", log_prefix, stamp)
+
+    # Prune the archive to the newest archive_runs runs
+    if archive_runs > 0 and os.path.isdir(archive_dir):
+        afiles = os.listdir(archive_dir)
+        astamps = sorted({s for f in afiles if (s := file_run_stamp(f))}, reverse=True)
+        for old in astamps[archive_runs:]:
+            for f in afiles:
+                if file_run_stamp(f) == old:
+                    try:
+                        os.unlink(os.path.join(archive_dir, f))
+                    except OSError as e:
+                        log.warning("%s: cannot prune archive %s: %s", log_prefix, f, e)
+            log.info("%s: pruned archived run %s", log_prefix, old)
 
 
 # ── GFS (NOMADS grib_filter) ──────────────────────────────────────────────────
@@ -179,7 +238,7 @@ def gfs_fetch(source: dict) -> str:
                 log.error("%s: run %s failed at step f%03d — aborting", name, stamp, step)
                 return "failed"
         open(marker_path(directory, stamp), "w").close()
-        cleanup_old_runs(directory, source.get("keep_runs", 1), name)
+        cleanup_old_runs(directory, source.get("archive_runs", 0), name)
         log.info("%s: run %s complete", name, stamp)
         return "downloaded"
     log.info("%s: no published run found among recent cycles", name)
@@ -249,7 +308,7 @@ def mf_fetch(source: dict) -> str:
                     log.error("%s: run %s failed at %s/%s — aborting", name, stamp, p, g)
                     return "failed"
         open(marker_path(directory, stamp), "w").close()
-        cleanup_old_runs(directory, source.get("keep_runs", 1), name)
+        cleanup_old_runs(directory, source.get("archive_runs", 0), name)
         log.info("%s: run %s complete", name, stamp)
         return "downloaded"
     log.info("%s: no published run found among recent cycles", name)
@@ -312,7 +371,7 @@ def icon_eu_fetch(source: dict) -> str:
                     os.unlink(part)
                 return "failed"
         open(marker_path(directory, stamp), "w").close()
-        cleanup_old_runs(directory, source.get("keep_runs", 1), name)
+        cleanup_old_runs(directory, source.get("archive_runs", 0), name)
         log.info("%s: run %s complete", name, stamp)
         return "downloaded"
     log.info("%s: no published run found among recent cycles", name)

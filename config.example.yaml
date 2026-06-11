@@ -13,7 +13,7 @@ sources:
     directory: /data/gfs-025
     bbox: [30, -10, 52, 15]     # Western Med / Bay of Biscay
     steps: {from: 0, to: 24, by: 3}
-    keep_runs: 1
+    archive_runs: 0          # runs archivés dans <dir>/archive/ (0 = aucun)
 
   - name: gfs-050
     model: gfs
@@ -21,7 +21,7 @@ sources:
     directory: /data/gfs-050
     bbox: [25, -25, 60, 20]
     steps: {from: 24, to: 120, by: 6}
-    keep_runs: 1
+    archive_runs: 0          # runs archivés dans <dir>/archive/ (0 = aucun)
 
   - name: arome-0025
     model: arome
@@ -29,7 +29,7 @@ sources:
     directory: /data/arome-0025
     packages: [SP1]             # parameter packages (SP1 = main surface fields)
     groups: ["00H06H", "07H12H", "13H18H", "19H24H"]   # time ranges (default: all)
-    keep_runs: 1
+    archive_runs: 0          # runs archivés dans <dir>/archive/ (0 = aucun)
 
   - name: arpege-01
     model: arpege
@@ -37,11 +37,11 @@ sources:
     directory: /data/arpege-01
     packages: [SP1]
     groups: ["000H012H", "013H024H", "025H036H", "037H048H"]
-    keep_runs: 1
+    archive_runs: 0          # runs archivés dans <dir>/archive/ (0 = aucun)
 
   - name: icon-eu
     model: icon-eu
     directory: /data/icon-eu
     steps: {from: 0, to: 48, by: 3}
     # variables: [t_2m, u_10m, v_10m, vmax_10m, pmsl, relhum_2m, tot_prec, clct]
-    keep_runs: 1
+    archive_runs: 0          # runs archivés dans <dir>/archive/ (0 = aucun)
