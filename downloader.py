@@ -25,6 +25,7 @@ Usage:
 """
 import argparse
 import bz2
+import json
 import logging
 import os
 import re
@@ -108,6 +109,25 @@ def latest_complete_stamp(directory: str):
     except FileNotFoundError:
         return None
     return max(stamps) if stamps else None
+
+
+def read_marker_bbox(directory: str, stamp: str):
+    """Bbox stored in a run marker (GFS), or None."""
+    try:
+        with open(marker_path(directory, stamp)) as f:
+            content = f.read().strip()
+        return json.loads(content).get("bbox") if content else None
+    except (OSError, ValueError):
+        return None
+
+
+def bbox_matches(a, b) -> bool:
+    if a is None and b is None:
+        return True
+    if a is None or b is None:
+        return False
+    return (len(a) == 4 and len(b) == 4
+            and all(abs(float(x) - float(y)) < 0.01 for x, y in zip(a, b)))
 
 
 def file_run_stamp(filename: str):
@@ -211,8 +231,13 @@ def gfs_fetch(source: dict) -> str:
     prod = GFS_PRODUCTS.get(res, f"pgrb2.{res}")
     for run in candidate_runs(cadence_h=6, delay_h=3.5):
         stamp = run_stamp(run)
+        zone_changed = False
         if latest_complete_stamp(directory) == stamp:
-            return "up-to-date"
+            if bbox_matches(read_marker_bbox(directory, stamp), bbox):
+                return "up-to-date"
+            # Same run but the download area changed — the files on disk
+            # cover the old zone and must be fetched again.
+            zone_changed = True
         # Run available (incl. last step)? Probe the .idx on the pub server.
         date, hh = run.strftime("%Y%m%d"), run.strftime("%H")
         probe = (f"https://nomads.ncep.noaa.gov/pub/data/nccf/com/gfs/prod/"
@@ -220,6 +245,15 @@ def gfs_fetch(source: dict) -> str:
         if not http_ok(probe):
             log.info("%s: run %s not published yet (probe failed)", name, stamp)
             continue
+
+        if zone_changed:
+            log.info("%s: download area changed — re-fetching run %s", name, stamp)
+            for f in os.listdir(directory):
+                if f"__{stamp}__" in f or f == f".run-{stamp}.complete":
+                    try:
+                        os.unlink(os.path.join(directory, f))
+                    except OSError:
+                        pass
 
         log.info("%s: downloading run %s (%d steps)", name, stamp, len(steps))
         params = [f"var_{v}=on" for v in variables] + [f"lev_{l}=on" for l in levels]
@@ -237,7 +271,8 @@ def gfs_fetch(source: dict) -> str:
             if not download(url, dest):
                 log.error("%s: run %s failed at step f%03d — aborting", name, stamp, step)
                 return "failed"
-        open(marker_path(directory, stamp), "w").close()
+        with open(marker_path(directory, stamp), "w") as mk:
+            mk.write(json.dumps({"bbox": bbox} if bbox else {}))
         cleanup_old_runs(directory, source.get("archive_runs", 0), name)
         log.info("%s: run %s complete", name, stamp)
         return "downloaded"
