@@ -63,17 +63,17 @@ See [config.example.yaml](config.example.yaml) for the configuration format.
 services:
   grib-gfs:
     image: grib-downloader
-    command: ["--loop", "--source", "gfs-025"]
+    command: ["python3", "/app/downloader.py", "--loop", "--source", "gfs-025"]
     volumes: ["./config.yaml:/config.yaml:ro", "./gribs:/data"]
     restart: unless-stopped
   grib-arome:
     image: grib-downloader
-    command: ["--loop", "--source", "arome-0025"]
+    command: ["python3", "/app/downloader.py", "--loop", "--source", "arome-0025"]
     volumes: ["./config.yaml:/config.yaml:ro", "./gribs:/data"]
     restart: unless-stopped
   grib-icon:
     image: grib-downloader
-    command: ["--loop", "--source", "icon-eu"]
+    command: ["python3", "/app/downloader.py", "--loop", "--source", "icon-eu"]
     volumes: ["./config.yaml:/config.yaml:ro", "./gribs:/data"]
     restart: unless-stopped
 ```

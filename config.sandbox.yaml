@@ -1,0 +1,33 @@
+# Sandbox deployment — Western Mediterranean, maximum duration per model.
+# Mount: /media/psf/DebianDev/misc/gribs:/data
+
+interval_minutes: 15
+
+sources:
+  - name: gfs-025
+    model: gfs
+    resolution: 0p25
+    directory: /data/gfs-025
+    bbox: [35, -6, 45, 17]          # Gibraltar → Italie / Tunisie
+    steps: {from: 0, to: 384, by: 3}  # 16 jours, pas 3 h
+    keep_runs: 1
+
+  - name: arome-0025
+    model: arome
+    resolution: "0025"
+    directory: /data/arome-0025
+    packages: [SP1]                 # SP2 (nébulosité) en collision de dédup — plus tard
+    keep_runs: 1                    # 51 h, pas 1 h (tous les groupes)
+
+  - name: arpege-01
+    model: arpege
+    resolution: "01"
+    directory: /data/arpege-01
+    packages: [SP1]
+    keep_runs: 1                    # 102 h, pas 1 h (tous les groupes)
+
+  - name: icon-eu
+    model: icon-eu
+    directory: /data/icon-eu
+    steps: {from: 0, to: 120, by: 3}  # 5 jours, pas 3 h
+    keep_runs: 1
