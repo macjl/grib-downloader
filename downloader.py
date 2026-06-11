@@ -111,23 +111,60 @@ def latest_complete_stamp(directory: str):
     return max(stamps) if stamps else None
 
 
-def read_marker_bbox(directory: str, stamp: str):
-    """Bbox stored in a run marker (GFS), or None."""
+# Keys of a source config that do not shape the downloaded data.
+FP_EXCLUDE = {"name", "model", "directory", "archive_runs", "keep_runs"}
+
+
+def normalize_params(v):
+    """Canonical form for fingerprint comparison: floats rounded to 2
+    decimals, dict keys sorted (via JSON round-trip on write)."""
+    if isinstance(v, float):
+        return round(v, 2)
+    if isinstance(v, (int, str, bool)) or v is None:
+        return v
+    if isinstance(v, list):
+        return [normalize_params(x) for x in v]
+    if isinstance(v, dict):
+        return {k: normalize_params(v[k]) for k in sorted(v)}
+    return v
+
+
+def fetch_fingerprint(source: dict) -> dict:
+    """The parameters that shape what a run's files contain (bbox, steps,
+    groups, packages, variables, resolution, …). A run is only up to date
+    if it was downloaded with the currently configured fingerprint."""
+    return normalize_params({k: v for k, v in source.items() if k not in FP_EXCLUDE})
+
+
+def read_marker_params(directory: str, stamp: str):
+    """Fingerprint stored in a run marker, or None (legacy/empty markers)."""
     try:
         with open(marker_path(directory, stamp)) as f:
             content = f.read().strip()
-        return json.loads(content).get("bbox") if content else None
+        if not content:
+            return None
+        data = json.loads(content)
+        return data.get("params") if isinstance(data, dict) else None
     except (OSError, ValueError):
         return None
 
 
-def bbox_matches(a, b) -> bool:
-    if a is None and b is None:
-        return True
-    if a is None or b is None:
-        return False
-    return (len(a) == 4 and len(b) == 4
-            and all(abs(float(x) - float(y)) < 0.01 for x, y in zip(a, b)))
+def write_marker(directory: str, stamp: str, params: dict):
+    with open(marker_path(directory, stamp), "w") as f:
+        json.dump({"params": params}, f)
+
+
+def run_is_current(directory: str, stamp: str, params: dict) -> bool:
+    return read_marker_params(directory, stamp) == params
+
+
+def wipe_run(directory: str, stamp: str):
+    for f in os.listdir(directory):
+        if f"__{stamp}__" in f or f == f".run-{stamp}.complete":
+            try:
+                os.unlink(os.path.join(directory, f))
+            except OSError:
+                pass
 
 
 def file_run_stamp(filename: str):
@@ -229,15 +266,16 @@ def gfs_fetch(source: dict) -> str:
     name = source["name"]
 
     prod = GFS_PRODUCTS.get(res, f"pgrb2.{res}")
+    fingerprint = fetch_fingerprint(source)
     for run in candidate_runs(cadence_h=6, delay_h=3.5):
         stamp = run_stamp(run)
-        zone_changed = False
+        params_changed = False
         if latest_complete_stamp(directory) == stamp:
-            if bbox_matches(read_marker_bbox(directory, stamp), bbox):
+            if run_is_current(directory, stamp, fingerprint):
                 return "up-to-date"
-            # Same run but the download area changed — the files on disk
-            # cover the old zone and must be fetched again.
-            zone_changed = True
+            # Same run but the fetch parameters (area, steps, variables…)
+            # changed — the files on disk don't match and must be re-fetched.
+            params_changed = True
         # Run available (incl. last step)? Probe the .idx on the pub server.
         date, hh = run.strftime("%Y%m%d"), run.strftime("%H")
         probe = (f"https://nomads.ncep.noaa.gov/pub/data/nccf/com/gfs/prod/"
@@ -246,14 +284,9 @@ def gfs_fetch(source: dict) -> str:
             log.info("%s: run %s not published yet (probe failed)", name, stamp)
             continue
 
-        if zone_changed:
-            log.info("%s: download area changed — re-fetching run %s", name, stamp)
-            for f in os.listdir(directory):
-                if f"__{stamp}__" in f or f == f".run-{stamp}.complete":
-                    try:
-                        os.unlink(os.path.join(directory, f))
-                    except OSError:
-                        pass
+        if params_changed:
+            log.info("%s: fetch parameters changed — re-fetching run %s", name, stamp)
+            wipe_run(directory, stamp)
 
         log.info("%s: downloading run %s (%d steps)", name, stamp, len(steps))
         params = [f"var_{v}=on" for v in variables] + [f"lev_{l}=on" for l in levels]
@@ -271,8 +304,7 @@ def gfs_fetch(source: dict) -> str:
             if not download(url, dest):
                 log.error("%s: run %s failed at step f%03d — aborting", name, stamp, step)
                 return "failed"
-        with open(marker_path(directory, stamp), "w") as mk:
-            mk.write(json.dumps({"bbox": bbox} if bbox else {}))
+        write_marker(directory, stamp, fingerprint)
         cleanup_old_runs(directory, source.get("archive_runs", 0), name)
         log.info("%s: run %s complete", name, stamp)
         return "downloaded"
@@ -320,16 +352,23 @@ def mf_fetch(source: dict) -> str:
     directory = source["directory"]
     name = source["name"]
 
+    fingerprint = fetch_fingerprint(source)
     for run in candidate_runs(cadence_h=cadence, delay_h=delay):
         stamp = run_stamp(run)
+        params_changed = False
         if latest_complete_stamp(directory) == stamp:
-            return "up-to-date"
+            if run_is_current(directory, stamp, fingerprint):
+                return "up-to-date"
+            params_changed = True
         d = run.strftime("%Y-%m-%dT%H:00:00Z")
         # Run available? Probe the last requested group of the first package.
         probe = f"{MF_BASE}/" + template.format(d=d, p=packages[0], g=groups[-1])
         if not http_ok(probe):
             log.info("%s: run %s not published yet (probe failed)", name, stamp)
             continue
+        if params_changed:
+            log.info("%s: fetch parameters changed — re-fetching run %s", name, stamp)
+            wipe_run(directory, stamp)
 
         log.info("%s: downloading run %s (%d packages × %d groups)",
                  name, stamp, len(packages), len(groups))
@@ -342,7 +381,7 @@ def mf_fetch(source: dict) -> str:
                 if not download(url, dest):
                     log.error("%s: run %s failed at %s/%s — aborting", name, stamp, p, g)
                     return "failed"
-        open(marker_path(directory, stamp), "w").close()
+        write_marker(directory, stamp, fingerprint)
         cleanup_old_runs(directory, source.get("archive_runs", 0), name)
         log.info("%s: run %s complete", name, stamp)
         return "downloaded"
@@ -365,10 +404,14 @@ def icon_eu_fetch(source: dict) -> str:
     variables = source.get("variables", ICON_EU_DEFAULT_VARS)
     name = source["name"]
 
+    fingerprint = fetch_fingerprint(source)
     for run in candidate_runs(cadence_h=6, delay_h=3.0):
         stamp = run_stamp(run)
+        params_changed = False
         if latest_complete_stamp(directory) == stamp:
-            return "up-to-date"
+            if run_is_current(directory, stamp, fingerprint):
+                return "up-to-date"
+            params_changed = True
         hh = run.strftime("%H")
         ymdh = run.strftime("%Y%m%d%H")
         # Run available (incl. last step)? Probe the first variable.
@@ -378,6 +421,10 @@ def icon_eu_fetch(source: dict) -> str:
         if not http_ok(probe):
             log.info("%s: run %s not published yet (probe failed)", name, stamp)
             continue
+
+        if params_changed:
+            log.info("%s: fetch parameters changed — re-fetching run %s", name, stamp)
+            wipe_run(directory, stamp)
 
         log.info("%s: downloading run %s (%d steps × %d vars)",
                  name, stamp, len(steps), len(variables))
@@ -405,7 +452,7 @@ def icon_eu_fetch(source: dict) -> str:
                 if os.path.exists(part):
                     os.unlink(part)
                 return "failed"
-        open(marker_path(directory, stamp), "w").close()
+        write_marker(directory, stamp, fingerprint)
         cleanup_old_runs(directory, source.get("archive_runs", 0), name)
         log.info("%s: run %s complete", name, stamp)
         return "downloaded"
