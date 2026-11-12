@@ -1,4 +1,4 @@
-FROM python:3.14-slim
+FROM python:3.15-slim
 RUN pip install --no-cache-dir requests pyyaml
 COPY downloader.py /app/downloader.py
 WORKDIR /app
